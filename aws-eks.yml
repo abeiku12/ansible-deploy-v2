@@ -1,0 +1,149 @@
+---
+- name: Deploy AWS Infrastructure and Install EKS with Best Practices
+  hosts: localhost
+  gather_facts: no
+  vars:
+    aws_region: us-east-1
+    eks_cluster_name: my-eks-cluster
+    vpc_cidr: "10.0.0.0/16"
+    public_subnets:
+      - cidr: "10.0.1.0/24"
+      - cidr: "10.0.2.0/24"
+    private_subnets:
+      - cidr: "10.0.3.0/24"
+      - cidr: "10.0.4.0/24"
+    eks_node_instance_type: t3.medium
+    eks_node_count: 2
+    eks_ami_type: AL2_x86_64
+
+  vars_files:
+    - vault.yml  # Encrypted file containing eks_node_key_name
+
+  tasks:
+    # Ensure Required Collections and Libraries
+    - name: Install amazon.aws collection if not present
+      ansible.builtin.command:
+        cmd: ansible-galaxy collection install amazon.aws
+
+    # Create VPC
+    - name: Create a VPC
+      amazon.aws.ec2_vpc:
+        name: "{{ eks_cluster_name }}-vpc"
+        cidr_block: "{{ vpc_cidr }}"
+        region: "{{ aws_region }}"
+        state: present
+      register: vpc
+
+    # Validate VPC
+    - name: Validate VPC creation
+      amazon.aws.ec2_vpc_info:
+        region: "{{ aws_region }}"
+        filters:
+          "vpc-id": "{{ vpc.vpc.id }}"
+      register: vpc_info
+
+    - name: Fail if VPC not found
+      ansible.builtin.fail:
+        msg: "VPC creation failed or is not accessible."
+      when: vpc_info.vpcs | length == 0
+
+    # Create Public Subnets
+    - name: Create public subnets
+      amazon.aws.ec2_vpc_subnet:
+        region: "{{ aws_region }}"
+        state: present
+        vpc_id: "{{ vpc.vpc.id }}"
+        subnets: "{{ public_subnets }}"
+        map_public: true
+        tags:
+          Name: "{{ eks_cluster_name }}-public-subnet"
+      register: public_subnets
+
+    # Create Private Subnets
+    - name: Create private subnets
+      amazon.aws.ec2_vpc_subnet:
+        region: "{{ aws_region }}"
+        state: present
+        vpc_id: "{{ vpc.vpc.id }}"
+        subnets: "{{ private_subnets }}"
+        tags:
+          Name: "{{ eks_cluster_name }}-private-subnet"
+      register: private_subnets
+
+    # Create Internet Gateway
+    - name: Create an Internet Gateway
+      amazon.aws.ec2_vpc_igw:
+        region: "{{ aws_region }}"
+        vpc_id: "{{ vpc.vpc.id }}"
+        state: present
+      register: igw
+
+    # Create EKS Cluster
+    - name: Create EKS cluster
+      amazon.aws.eks_cluster:
+        name: "{{ eks_cluster_name }}"
+        version: "1.27"
+        region: "{{ aws_region }}"
+        vpc_config:
+          subnets: "{{ public_subnets.subnets | map(attribute='id') | list }}"
+          endpoint_public_access: true
+        state: present
+      register: eks_cluster
+      retries: 5
+      delay: 120
+      until: eks_cluster is succeeded
+
+    # Create EKS Node Group
+    - name: Create EKS Node Group
+      amazon.aws.eks_nodegroup:
+        cluster_name: "{{ eks_cluster_name }}"
+        nodegroup_name: "{{ eks_cluster_name }}-nodegroup"
+        version: "1.27"
+        region: "{{ aws_region }}"
+        scaling_config:
+          desired_size: "{{ eks_node_count }}"
+          max_size: "{{ eks_node_count + 2 }}"
+          min_size: 1
+        instance_types:
+          - "{{ eks_node_instance_type }}"
+        disk_size: 20
+        subnets: "{{ private_subnets.subnets | map(attribute='id') | list }}"
+        ami_type: "{{ eks_ami_type }}"
+        key_name: "{{ eks_node_key_name }}"
+        state: present
+      retries: 5
+      delay: 120
+      until: eks_nodegroup is succeeded
+
+    # Configure kubectl
+    - name: Configure kubectl to connect to the cluster
+      command: >
+        aws eks update-kubeconfig
+        --region {{ aws_region }}
+        --name {{ eks_cluster_name }}
+
+    # Deploy Kubernetes Dashboard
+    - name: Deploy Kubernetes dashboard
+      ansible.builtin.command:
+        cmd: kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml
+
+    # Install Monitoring Tools (Prometheus & Grafana)
+    - name: Add Helm repositories for Prometheus and Grafana
+      ansible.builtin.command:
+        cmd: >
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts &&
+          helm repo add grafana https://grafana.github.io/helm-charts &&
+          helm repo update
+
+    - name: Install Prometheus
+      ansible.builtin.command:
+        cmd: helm install prometheus prometheus-community/prometheus
+
+    - name: Install Grafana
+      ansible.builtin.command:
+        cmd: helm install grafana grafana/grafana
+
+    # Log Completion
+    - name: Log successful EKS deployment
+      ansible.builtin.debug:
+        msg: "EKS cluster {{ eks_cluster_name }} deployed successfully in region {{ aws_region }}"
